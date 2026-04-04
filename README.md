@@ -157,4 +157,4 @@ MIT License
 
 ## Author
 
-Jesus Espinoza (@jespinozasoto3)
+Jesus Espinoza (@arthusuxD)
