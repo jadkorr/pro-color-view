@@ -1,0 +1,37 @@
+plugins {
+    id 'java'
+}
+
+group = 'com.procolorview'
+version = '2.0.0'
+sourceCompatibility = '17'
+targetCompatibility = '17'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // Burp Suite Montoya API
+    compileOnly 'net.portswigger.burp.extensions:montoya-api:2025.5'
+
+    // RSyntaxTextArea (opcional, para syntax highlighting avanzado)
+    // Si quieres incluirlo como fat-jar, cambia a 'implementation'
+    compileOnly 'com.fifesoft:rsyntaxtextarea:3.5.3'
+    compileOnly 'com.fifesoft:autocomplete:3.3.1'
+}
+
+jar {
+    manifest {
+        attributes(
+            'Implementation-Title': 'Pro Color View',
+            'Implementation-Version': version
+        )
+    }
+    // Fat JAR: incluye todas las dependencias runtime
+    from {
+        configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+    }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    archiveBaseName.set('pro-color-view')
+}
