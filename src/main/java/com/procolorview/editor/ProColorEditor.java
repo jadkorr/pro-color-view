@@ -5,6 +5,7 @@ import burp.api.montoya.core.ByteArray;
 import burp.api.montoya.http.HttpService;
 import burp.api.montoya.http.message.requests.HttpRequest;
 
+import com.procolorview.ai.AiPanel;
 import com.procolorview.colorizer.HttpColorizer;
 import com.procolorview.overlay.OverlayManager;
 import com.procolorview.parser.HttpMessageParser;
@@ -109,6 +110,20 @@ public class ProColorEditor {
     private boolean updating = false;
     private boolean prettyMode = true;
     private ParsedHttpMessage lastParsed;
+    private int lastContentHash = 0; // hash of last rendered content to skip re-render
+
+    // LRU cache: content hash → rendered StyledDocument (avoids re-colorizing same content)
+    private static final int DOC_CACHE_SIZE = 10;
+    private final LinkedHashMap<Integer, javax.swing.text.DefaultStyledDocument> docCache =
+            new LinkedHashMap<Integer, javax.swing.text.DefaultStyledDocument>(DOC_CACHE_SIZE + 1, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<Integer, javax.swing.text.DefaultStyledDocument> eldest) {
+                    return size() > DOC_CACHE_SIZE;
+                }
+            };
+
+    // Async render: track current worker so we can cancel if user navigates away
+    private SwingWorker<javax.swing.text.DefaultStyledDocument, Void> asyncRenderWorker;
 
     // Original HttpService from Burp (for correct host/port/https when sending)
     private HttpService originalService;
@@ -123,6 +138,12 @@ public class ProColorEditor {
     private byte[] companionContent;
     private boolean companionIsRequest;
     private ParsedHttpMessage companionParsed;
+
+    // Minimize Headers state for companion
+    private List<Map.Entry<String, String>> companionOriginalHeaders;
+    private String companionOriginalStartLine;
+    private String companionOriginalBody;
+    private Set<String> companionHiddenHeaderKeys;
 
     // Plataforma
     private static final boolean IS_MAC = System.getProperty("os.name", "")
@@ -150,14 +171,24 @@ public class ProColorEditor {
     private static final Pattern PAT_JS_FILE_REF = Pattern.compile(
             "(?i)(?:src|href)\\s*=\\s*['\"]([^'\"]*\\.js(?:\\?[^'\"]*)?)['\"]");
 
+    // AI Panel
+    private AiPanel aiPanel;
+
     // Reusable timer for button feedback
     private javax.swing.Timer feedbackTimer;
+
+    // Reusable document listener (single instance — avoids duplication on doc swap)
+    private final DocumentListener docModListener = new DocumentListener() {
+        @Override public void insertUpdate(DocumentEvent e)  { markModified(); updateStats(); }
+        @Override public void removeUpdate(DocumentEvent e)  { markModified(); updateStats(); }
+        @Override public void changedUpdate(DocumentEvent e) { markModified(); }
+    };
 
     public ProColorEditor(MontoyaApi api, ProColorTheme theme) {
         this.api = api;
         this.theme = theme;
         this.undoManager = new UndoManager();
-        this.undoManager.setLimit(200);
+        this.undoManager.setLimit(50);
 
         mainPanel = new JPanel(new BorderLayout());
 
@@ -172,9 +203,24 @@ public class ProColorEditor {
         decoderPanel = createDecoderPanel();
         JPanel statusBar = createStatusBar();
 
+        aiPanel = new AiPanel(theme, api);
+        aiPanel.setContentSuppliers(
+                () -> editorText(),
+                () -> companionParsed != null ? companionParsed.rebuild() : "",
+                () -> {
+                    // Raw request bytes: if this is a request editor, use currentContent;
+                    // if response editor, use companion content (which is the request)
+                    if (isRequest && currentContent != null) return currentContent;
+                    if (!isRequest && companionContent != null) return companionContent;
+                    return currentContent;
+                },
+                () -> originalService
+        );
+
         JPanel bottomPanel = new JPanel();
         bottomPanel.setLayout(new BoxLayout(bottomPanel, BoxLayout.Y_AXIS));
         bottomPanel.add(decoderPanel);
+        bottomPanel.add(aiPanel);
         bottomPanel.add(statusBar);
 
         mainPanel.add(toolbar, BorderLayout.NORTH);
@@ -182,11 +228,7 @@ public class ProColorEditor {
         mainPanel.add(bottomPanel, BorderLayout.SOUTH);
 
         editor.getDocument().addUndoableEditListener(undoManager);
-        editor.getDocument().addDocumentListener(new DocumentListener() {
-            @Override public void insertUpdate(DocumentEvent e)  { markModified(); updateStats(); }
-            @Override public void removeUpdate(DocumentEvent e)  { markModified(); updateStats(); }
-            @Override public void changedUpdate(DocumentEvent e) { markModified(); }
-        });
+        editor.getDocument().addDocumentListener(docModListener);
 
         // Decoder + stats: se actualiza al seleccionar texto
         editor.addCaretListener(new CaretListener() {
@@ -229,17 +271,64 @@ public class ProColorEditor {
                 modified = false;
                 searchStatus.setText(" ");
                 lastParsed = null;
+                lastContentHash = 0;
                 updateStats();
                 return;
             }
-            String raw = new String(content);
-            lastParsed = HttpMessageParser.parse(raw, isRequest);
-            renderWithOverlays();
+
+            // Cancel any pending async render from a previous item
+            if (asyncRenderWorker != null && !asyncRenderWorker.isDone()) {
+                asyncRenderWorker.cancel(true);
+                asyncRenderWorker = null;
+            }
+
+            // Compute hash: content + prettyMode to detect same content
+            int contentHash = Arrays.hashCode(content) * 31 + (prettyMode ? 1 : 0) + (isRequest ? 2 : 0);
+
+            // For large binary content (PDF, images, EXE), only convert headers + first 128 bytes
+            // instead of converting the entire multi-MB byte[] to String
+            boolean isBinary = quickBinaryCheck(content);
+            String raw;
+            int realBodySize = -1;
+            if (isBinary) {
+                raw = buildTruncatedRaw(content);
+                // Calculate real body size from the original byte[]
+                String probe = new String(content, 0, Math.min(content.length, 4096), StandardCharsets.ISO_8859_1);
+                int sep = probe.indexOf("\r\n\r\n");
+                int bodyStart = (sep >= 0) ? sep + 4 : -1;
+                if (bodyStart < 0) { sep = probe.indexOf("\n\n"); bodyStart = (sep >= 0) ? sep + 2 : -1; }
+                realBodySize = (bodyStart >= 0) ? content.length - bodyStart : content.length;
+            } else {
+                raw = new String(content);
+            }
+            lastParsed = HttpMessageParser.parse(raw, isRequest, realBodySize);
+
+            // Check LRU cache for a pre-rendered document (skip expensive colorization)
+            javax.swing.text.DefaultStyledDocument cachedDoc = docCache.get(contentHash);
+            if (cachedDoc != null) {
+                // Reuse cached document — instant, no re-colorization
+                editor.setDocument(cachedDoc);
+                reattachDocListeners(cachedDoc);
+            } else {
+                int totalLen = raw.length();
+                if (totalLen > 30_000) {
+                    // Large content: show plain text NOW, colorize in background
+                    showPlainTextInstant(raw);
+                    renderAsync(contentHash);
+                } else {
+                    // Small content: render offscreen synchronously (fast enough)
+                    renderOffscreen();
+                    if (editor.getDocument() instanceof javax.swing.text.DefaultStyledDocument) {
+                        docCache.put(contentHash, (javax.swing.text.DefaultStyledDocument) editor.getDocument());
+                    }
+                }
+            }
+
+            lastContentHash = contentHash;
             editor.setCaretPosition(0);
             modified = false;
             updateStats();
-            SwingUtilities.invokeLater(undoManager::discardAllEdits);
-            // Auto-save snapshot on content load
+            undoManager.discardAllEdits();
             editorHistory.save("Loaded " + (isRequest ? "request" : "response"), raw);
         } finally {
             this.updating = false;
@@ -253,6 +342,12 @@ public class ProColorEditor {
      */
     public byte[] getContent() {
         String text = modified ? editor.getText() : (currentContent != null ? new String(currentContent) : "");
+        // Normalize CRLF (Swing uses LF only, HTTP requires CRLF)
+        text = normalizeCrlf(text);
+        // Ensure trailing CRLF — HTTP requests must end with \r\n
+        if (isRequest && !text.isEmpty() && !text.endsWith("\r\n")) {
+            text += "\r\n";
+        }
         // Apply template variables transparently before returning to Burp
         return TemplateVars.apply(text).getBytes();
     }
@@ -271,6 +366,11 @@ public class ProColorEditor {
     public void setCompanion(byte[] content, boolean isRequest) {
         this.companionContent = content;
         this.companionIsRequest = isRequest;
+        // Reset companion minimize state
+        this.companionOriginalHeaders = null;
+        this.companionOriginalStartLine = null;
+        this.companionOriginalBody = null;
+        this.companionHiddenHeaderKeys = null;
         if (content != null && content.length > 0) {
             try {
                 this.companionParsed = HttpMessageParser.parse(new String(content), isRequest);
@@ -282,20 +382,193 @@ public class ProColorEditor {
         }
     }
 
+    // ── Binary fast-path ─────────────────────────────────────────────
+
+    /** Quickly scan raw bytes for binary content-type headers (PDF, image, octet-stream, etc.)
+     *  without converting the full byte[] to String. Only checks the first 4KB (headers). */
+    private static boolean quickBinaryCheck(byte[] content) {
+        if (content.length < 100) return false;
+        // Only scan the first 4KB for headers
+        int scanLen = Math.min(content.length, 4096);
+        String headerArea = new String(content, 0, scanLen, StandardCharsets.ISO_8859_1).toLowerCase();
+        // Must have a header separator
+        int sep = headerArea.indexOf("\r\n\r\n");
+        if (sep < 0) sep = headerArea.indexOf("\n\n");
+        if (sep < 0) return false;
+        String headers = headerArea.substring(0, sep);
+        int ctIdx = headers.indexOf("content-type:");
+        if (ctIdx < 0) return false;
+        String ctLine = headers.substring(ctIdx + 13);
+        ctLine = ctLine.split("\\r?\\n")[0].trim();
+        return ctLine.contains("pdf") || ctLine.contains("image/") || ctLine.contains("octet-stream")
+                || ctLine.contains("video/") || ctLine.contains("audio/") || ctLine.contains("font/")
+                || ctLine.contains("zip") || ctLine.contains("gzip") || ctLine.contains("woff")
+                || ctLine.contains("protobuf") || ctLine.contains("grpc") || ctLine.contains("wasm")
+                || ctLine.contains("x-shockwave") || ctLine.contains("x-executable")
+                || ctLine.contains("x-msdos") || ctLine.contains("x-msdownload");
+    }
+
+    /** Build a truncated raw string: full headers + only first 128 bytes of body.
+     *  This avoids converting multi-MB binary payloads to String. */
+    private static String buildTruncatedRaw(byte[] content) {
+        String full = new String(content, 0, Math.min(content.length, 4096), StandardCharsets.ISO_8859_1);
+        int sep = full.indexOf("\r\n\r\n");
+        int bodyStart = (sep >= 0) ? sep + 4 : -1;
+        if (bodyStart < 0) {
+            sep = full.indexOf("\n\n");
+            bodyStart = (sep >= 0) ? sep + 2 : -1;
+        }
+        if (bodyStart < 0) return full;
+        // Convert only headers + first 128 body bytes
+        int endPos = Math.min(content.length, bodyStart + 128);
+        return new String(content, 0, endPos, StandardCharsets.ISO_8859_1);
+    }
+
     // ── Renderizado ─────────────────────────────────────────────────
 
+    /**
+     * Renders the current parsed message with syntax highlighting.
+     * For large content, renders into an off-screen document first,
+     * then swaps it into the editor atomically (no per-token repaints).
+     */
     private void renderWithOverlays() {
         if (lastParsed == null) return;
+        // Always render off-screen into a NEW document to avoid overwriting cached documents
+        renderOffscreen();
+    }
+
+    /**
+     * Show plain (uncolorized) text instantly so the user sees content immediately.
+     * Used as a placeholder while async colorization runs in background.
+     */
+    private void showPlainTextInstant(String raw) {
+        boolean wasUpdating = updating;
+        updating = true;
+        try {
+            javax.swing.text.DefaultStyledDocument plainDoc = new javax.swing.text.DefaultStyledDocument();
+            javax.swing.text.SimpleAttributeSet plainAttr = new javax.swing.text.SimpleAttributeSet();
+            javax.swing.text.StyleConstants.setForeground(plainAttr, theme.fg);
+            javax.swing.text.StyleConstants.setFontFamily(plainAttr, theme.editorFont.getFamily());
+            javax.swing.text.StyleConstants.setFontSize(plainAttr, theme.editorFont.getSize());
+            plainDoc.insertString(0, raw, plainAttr);
+            editor.setDocument(plainDoc);
+            reattachDocListeners(plainDoc);
+        } catch (Exception ignored) {
+        } finally {
+            updating = wasUpdating;
+        }
+    }
+
+    /**
+     * Colorize in a background thread, then swap the colorized document into the editor.
+     * The user sees plain text immediately; colorized version replaces it when ready.
+     */
+    private void renderAsync(final int contentHash) {
+        final ParsedHttpMessage parsed = lastParsed;
+        final ProColorTheme t = theme;
+        final boolean pretty = prettyMode;
+        final String hlWords = highlightField != null ? highlightField.getText() : "";
+        final String blurWords = blurField != null ? blurField.getText() : "";
+
+        asyncRenderWorker = new SwingWorker<javax.swing.text.DefaultStyledDocument, Void>() {
+            @Override
+            protected javax.swing.text.DefaultStyledDocument doInBackground() throws Exception {
+                // Render into a fresh document OFF the EDT
+                javax.swing.text.DefaultStyledDocument offDoc = new javax.swing.text.DefaultStyledDocument();
+                HttpColorizer.render(offDoc, parsed, t, pretty);
+                if (!hlWords.isBlank()) OverlayManager.applyHighlights(offDoc, hlWords, t);
+                if (!blurWords.isBlank()) OverlayManager.applyBlur(offDoc, blurWords, t);
+                return offDoc;
+            }
+
+            @Override
+            protected void done() {
+                if (isCancelled()) return;
+                try {
+                    javax.swing.text.DefaultStyledDocument colorDoc = get();
+                    // Only swap if the user hasn't navigated to a different item
+                    if (lastParsed == parsed) {
+                        boolean wasUpdating = updating;
+                        updating = true;
+                        try {
+                            editor.setDocument(colorDoc);
+                            reattachDocListeners(colorDoc);
+                            editor.setCaretPosition(0);
+                            docCache.put(contentHash, colorDoc);
+                        } finally {
+                            updating = wasUpdating;
+                        }
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+        };
+        asyncRenderWorker.execute();
+    }
+
+    /** Render directly into the editor's document (fast for small content) */
+    private void renderInPlace() {
         boolean wasUpdating = updating;
         updating = true;
         try {
             HttpColorizer.render(editor.getStyledDocument(), lastParsed, theme, prettyMode);
             String hlWords = highlightField != null ? highlightField.getText() : "";
-            OverlayManager.applyHighlights(editor.getStyledDocument(), hlWords, theme);
+            if (!hlWords.isBlank()) OverlayManager.applyHighlights(editor.getStyledDocument(), hlWords, theme);
             String blurWords = blurField != null ? blurField.getText() : "";
-            OverlayManager.applyBlur(editor.getStyledDocument(), blurWords, theme);
+            if (!blurWords.isBlank()) OverlayManager.applyBlur(editor.getStyledDocument(), blurWords, theme);
         } finally {
             updating = wasUpdating;
+        }
+    }
+
+    /**
+     * Render into a NEW off-screen document (no listeners, no repaints),
+     * then swap it into the editor in one shot.
+     * This eliminates the per-token repaint lag for large responses.
+     */
+    private void renderOffscreen() {
+        boolean wasUpdating = updating;
+        updating = true;
+        try {
+            // Create a fresh document with no listeners attached
+            javax.swing.text.DefaultStyledDocument offDoc = new javax.swing.text.DefaultStyledDocument();
+
+            // Render colorized content into the off-screen document
+            HttpColorizer.render(offDoc, lastParsed, theme, prettyMode);
+
+            // Apply overlays
+            String hlWords = highlightField != null ? highlightField.getText() : "";
+            if (!hlWords.isBlank()) OverlayManager.applyHighlights(offDoc, hlWords, theme);
+            String blurWords = blurField != null ? blurField.getText() : "";
+            if (!blurWords.isBlank()) OverlayManager.applyBlur(offDoc, blurWords, theme);
+
+            // Swap the document into the editor — single atomic operation
+            editor.setDocument(offDoc);
+
+            // Re-attach listeners to the new document (single instances — no duplication)
+            reattachDocListeners(offDoc);
+
+        } finally {
+            updating = wasUpdating;
+        }
+    }
+
+    /**
+     * Re-attach document listeners after swapping a document into the editor.
+     * Removes existing listeners first to prevent accumulation on cached docs.
+     */
+    private void reattachDocListeners(javax.swing.text.DefaultStyledDocument doc) {
+        // Remove first to prevent duplication on cached documents
+        doc.removeUndoableEditListener(undoManager);
+        doc.removeDocumentListener(docModListener);
+        if (lineGutter != null) doc.removeDocumentListener(lineGutter);
+
+        // Re-add
+        doc.addUndoableEditListener(undoManager);
+        doc.addDocumentListener(docModListener);
+        if (lineGutter != null) {
+            doc.addDocumentListener(lineGutter);
+            lineGutter.changedUpdate(null);
         }
     }
 
@@ -671,12 +944,32 @@ public class ProColorEditor {
         JButton minimizeBtn = btn("\u2702", "Minimize Headers — remove unnecessary headers");
         minimizeBtn.addActionListener(e -> minimizeHeaders());
 
+        JButton colorsBtn = btn("\uD83C\uDFA8", "Configure parameter colors (URL params & form body)");
+        colorsBtn.addActionListener(e -> {
+            if (com.procolorview.util.ColorConfig.showConfigDialog(mainPanel, theme.isDark())) {
+                // Clear cache and re-render to apply new colors
+                docCache.clear();
+                lastContentHash = 0;
+                if (lastParsed != null) renderWithOverlays();
+                searchStatus.setText("Parameter colors updated");
+            }
+        });
+
+        // ── AI Testing ──
+        JButton aiBtn = btn("\uD83E\uDD16 AI", "AI Vulnerability Testing");
+        aiBtn.setForeground(new Color(255, 180, 60));
+        aiBtn.setFont(theme.editorFont.deriveFont(Font.BOLD, 11f));
+        aiBtn.addActionListener(e -> aiPanel.toggle());
+
         toolbar.add(varsBtn);
+        toolbar.add(colorsBtn);
         toolbar.add(sep());
         toolbar.add(historyBtn);
         toolbar.add(saveSnapBtn);
         toolbar.add(sep());
         toolbar.add(minimizeBtn);
+        toolbar.add(sep());
+        toolbar.add(aiBtn);
 
         highlightField.addActionListener(e -> applyOverlays());
         blurField.addActionListener(e -> applyOverlays());
@@ -770,7 +1063,43 @@ public class ProColorEditor {
         g.gridx = 1; g.weightx = 1.0; g.fill = GridBagConstraints.BOTH;
         panel.add(sp, g);
 
+        // Replace button — replaces selected text in editor with decoded/encoded value
+        JButton decoderReplaceBtn = new JButton("Replace");
+        decoderReplaceBtn.setFont(theme.editorFont.deriveFont(10f));
+        decoderReplaceBtn.setMargin(new Insets(1, 4, 1, 4));
+        decoderReplaceBtn.setForeground(theme.isDark() ? new Color(255, 200, 100) : new Color(180, 100, 0));
+        decoderReplaceBtn.setToolTipText("Replace selected text in editor with this value");
+        decoderReplaceBtn.addActionListener(e -> {
+            String replacement = decoderText.getText();
+            if (replacement == null || replacement.isEmpty()) return;
+            if (decoderSelStart < 0 || decoderSelEnd < 0) return;
+            decoderBusy = true;
+            try {
+                Document doc = editor.getDocument();
+                int docLen = doc.getLength();
+                int start = Math.min(decoderSelStart, docLen);
+                int end = Math.min(decoderSelEnd, docLen);
+                if (start > end) return;
+                doc.remove(start, end - start);
+                doc.insertString(start, replacement, null);
+                decoderSelEnd = start + replacement.length();
+                editor.select(start, decoderSelEnd);
+                modified = true;
+                decoderReplaceBtn.setText("OK!");
+                if (feedbackTimer != null) feedbackTimer.stop();
+                feedbackTimer = new Timer(1000, ev -> decoderReplaceBtn.setText("Replace"));
+                feedbackTimer.setRepeats(false);
+                feedbackTimer.start();
+            } catch (BadLocationException ignored) {
+            } finally {
+                decoderBusy = false;
+            }
+        });
+
         g.gridx = 2; g.weightx = 0; g.fill = GridBagConstraints.NONE;
+        panel.add(decoderReplaceBtn, g);
+
+        g.gridx = 3; g.weightx = 0; g.fill = GridBagConstraints.NONE;
         panel.add(decoderCopyBtn, g);
 
         panel.setVisible(false);
@@ -1138,6 +1467,7 @@ public class ProColorEditor {
     private void togglePretty() {
         editorHistory.save("Before " + (prettyMode ? "Minify" : "Pretty"), editorText());
         prettyMode = !prettyMode;
+        lastContentHash = 0; // force re-render with new mode
         prettyBtn.setText(prettyMode ? "Pretty" : "Minify");
         if (lastParsed != null) {
             int pos = editor.getCaretPosition();
@@ -1337,25 +1667,74 @@ public class ProColorEditor {
      */
     private void openResponseInBrowser() {
         try {
-            String text;
-            if (!isRequest) {
-                text = editorText();
+            byte[] raw;
+            if (!isRequest && currentContent != null) {
+                raw = currentContent;
             } else if (companionContent != null) {
-                text = new String(companionContent);
+                raw = companionContent;
             } else {
                 info("No response available."); return;
             }
-            // Extract body (after blank line)
-            int sep = text.indexOf("\r\n\r\n");
-            if (sep < 0) sep = text.indexOf("\n\n");
-            String body = (sep >= 0) ? text.substring(sep).strip() : text;
-            if (body.isEmpty()) { info("Response body is empty."); return; }
-            // Write to temp file and open
-            java.io.File tmp = java.io.File.createTempFile("burp_response_", ".html");
+
+            // Find header/body separator in raw bytes
+            String fullText = new String(raw);
+            int sep = fullText.indexOf("\r\n\r\n");
+            int bodyOffset = (sep >= 0) ? sep + 4 : -1;
+            if (bodyOffset < 0) {
+                sep = fullText.indexOf("\n\n");
+                bodyOffset = (sep >= 0) ? sep + 2 : -1;
+            }
+            if (bodyOffset < 0 || bodyOffset >= raw.length) {
+                info("Response body is empty."); return;
+            }
+
+            // Extract body as raw bytes (important for binary content)
+            byte[] bodyBytes = new byte[raw.length - bodyOffset];
+            System.arraycopy(raw, bodyOffset, bodyBytes, 0, bodyBytes.length);
+            if (bodyBytes.length == 0) { info("Response body is empty."); return; }
+
+            // Detect Content-Type from headers to pick the right file extension
+            String headers = fullText.substring(0, bodyOffset).toLowerCase();
+            String ext = ".html"; // default
+            if (headers.contains("content-type:")) {
+                String ct = headers.substring(headers.indexOf("content-type:") + 13);
+                ct = ct.split("\\r?\\n")[0].trim().toLowerCase();
+                if (ct.contains("pdf")) ext = ".pdf";
+                else if (ct.contains("png")) ext = ".png";
+                else if (ct.contains("jpeg") || ct.contains("jpg")) ext = ".jpg";
+                else if (ct.contains("gif")) ext = ".gif";
+                else if (ct.contains("webp")) ext = ".webp";
+                else if (ct.contains("svg")) ext = ".svg";
+                else if (ct.contains("json")) ext = ".json";
+                else if (ct.contains("xml")) ext = ".xml";
+                else if (ct.contains("javascript")) ext = ".js";
+                else if (ct.contains("css")) ext = ".css";
+                else if (ct.contains("plain")) ext = ".txt";
+                else if (ct.contains("octet-stream")) ext = ".bin";
+                else if (ct.contains("zip")) ext = ".zip";
+                else if (ct.contains("mp4")) ext = ".mp4";
+                else if (ct.contains("webm")) ext = ".webm";
+                else if (ct.contains("mp3") || ct.contains("mpeg")) ext = ".mp3";
+                else if (ct.contains("wav")) ext = ".wav";
+                else if (ct.contains("ico")) ext = ".ico";
+                else if (ct.contains("bmp")) ext = ".bmp";
+                else if (ct.contains("tiff")) ext = ".tiff";
+            }
+
+            // Write raw bytes to temp file and open with system default app
+            java.io.File tmp = java.io.File.createTempFile("burp_response_", ext);
             tmp.deleteOnExit();
-            java.nio.file.Files.writeString(tmp.toPath(), body);
-            java.awt.Desktop.getDesktop().browse(tmp.toURI());
-            searchStatus.setText("Opened in browser");
+            java.nio.file.Files.write(tmp.toPath(), bodyBytes);
+
+            // For browser-viewable types, use browse(); for others, use open()
+            if (ext.equals(".html") || ext.equals(".svg") || ext.equals(".json")
+                    || ext.equals(".xml") || ext.equals(".txt") || ext.equals(".pdf")
+                    || ext.equals(".js") || ext.equals(".css")) {
+                java.awt.Desktop.getDesktop().browse(tmp.toURI());
+            } else {
+                java.awt.Desktop.getDesktop().open(tmp);
+            }
+            searchStatus.setText("Opened in browser: " + ext);
         } catch (Exception e) {
             info("Error opening in browser: " + e.getMessage());
         }
@@ -2330,8 +2709,8 @@ public class ProColorEditor {
         split.setBackground(theme.bg);
         split.setBorder(BorderFactory.createEmptyBorder());
 
-        // ── Snap toolbar with HL/Blur fields ──
-        JPanel snapToolbar = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 2));
+        // ── Snap toolbar with HL/Blur fields (responsive wrap) ──
+        JPanel snapToolbar = new JPanel(new WrapLayout(FlowLayout.LEFT, 4, 2));
         snapToolbar.setBackground(theme.bg);
         snapToolbar.setBorder(BorderFactory.createMatteBorder(0, 0, 1, 0,
                 theme.isDark() ? new Color(60, 60, 60) : new Color(200, 200, 200)));
@@ -2382,6 +2761,115 @@ public class ProColorEditor {
         snapToolbar.add(snapBlurL);
         snapToolbar.add(snapBlurField);
         snapToolbar.add(snapApplyBtn);
+
+        // ── Annotation toolbar (draw tools) ──
+        JSeparator annoSep = new JSeparator(SwingConstants.VERTICAL);
+        annoSep.setPreferredSize(new Dimension(1, 18));
+        annoSep.setForeground(theme.bodyHint);
+        snapToolbar.add(annoSep);
+
+        AnnotationPanel annotationOverlay = new AnnotationPanel();
+
+        JButton rectBtn = new JButton("\u25AD Rect");
+        rectBtn.setFont(theme.editorFont.deriveFont(10f));
+        rectBtn.setBackground(theme.searchFieldBg);
+        rectBtn.setForeground(theme.fg);
+        rectBtn.setFocusPainted(false);
+        rectBtn.setMargin(new Insets(2, 6, 2, 6));
+        rectBtn.setToolTipText("Draw rectangle annotation");
+
+        JButton arrowBtn = new JButton("\u2192 Arrow");
+        arrowBtn.setFont(theme.editorFont.deriveFont(10f));
+        arrowBtn.setBackground(theme.searchFieldBg);
+        arrowBtn.setForeground(theme.fg);
+        arrowBtn.setFocusPainted(false);
+        arrowBtn.setMargin(new Insets(2, 6, 2, 6));
+        arrowBtn.setToolTipText("Draw arrow annotation");
+
+        JButton undoAnnoBtn = new JButton("Undo");
+        undoAnnoBtn.setFont(theme.editorFont.deriveFont(10f));
+        undoAnnoBtn.setBackground(theme.searchFieldBg);
+        undoAnnoBtn.setForeground(theme.fg);
+        undoAnnoBtn.setFocusPainted(false);
+        undoAnnoBtn.setMargin(new Insets(2, 6, 2, 6));
+        undoAnnoBtn.setToolTipText("Undo last annotation (Ctrl+Z)");
+
+        JButton clearAnnoBtn = new JButton("Clear");
+        clearAnnoBtn.setFont(theme.editorFont.deriveFont(10f));
+        clearAnnoBtn.setBackground(theme.searchFieldBg);
+        clearAnnoBtn.setForeground(theme.fg);
+        clearAnnoBtn.setFocusPainted(false);
+        clearAnnoBtn.setMargin(new Insets(2, 6, 2, 6));
+        clearAnnoBtn.setToolTipText("Clear all annotations");
+
+        // Color picker button
+        JButton colorAnnoBtn = new JButton("\u25CF");
+        colorAnnoBtn.setFont(theme.editorFont.deriveFont(12f));
+        colorAnnoBtn.setForeground(annotationOverlay.getAnnotationColor());
+        colorAnnoBtn.setBackground(theme.searchFieldBg);
+        colorAnnoBtn.setFocusPainted(false);
+        colorAnnoBtn.setMargin(new Insets(2, 6, 2, 6));
+        colorAnnoBtn.setToolTipText("Change annotation color");
+
+        // Active tool highlight
+        Runnable updateToolButtons = () -> {
+            AnnotationPanel.Tool tool = annotationOverlay.getTool();
+            Color activeBg = theme.isDark() ? new Color(60, 80, 110) : new Color(180, 210, 240);
+            rectBtn.setBackground(tool == AnnotationPanel.Tool.RECT ? activeBg : theme.searchFieldBg);
+            arrowBtn.setBackground(tool == AnnotationPanel.Tool.ARROW ? activeBg : theme.searchFieldBg);
+        };
+
+        rectBtn.addActionListener(e -> {
+            annotationOverlay.setTool(
+                    annotationOverlay.getTool() == AnnotationPanel.Tool.RECT
+                            ? AnnotationPanel.Tool.NONE : AnnotationPanel.Tool.RECT);
+            updateToolButtons.run();
+        });
+        arrowBtn.addActionListener(e -> {
+            annotationOverlay.setTool(
+                    annotationOverlay.getTool() == AnnotationPanel.Tool.ARROW
+                            ? AnnotationPanel.Tool.NONE : AnnotationPanel.Tool.ARROW);
+            updateToolButtons.run();
+        });
+        undoAnnoBtn.addActionListener(e -> annotationOverlay.undoLast());
+        clearAnnoBtn.addActionListener(e -> annotationOverlay.clearAll());
+        colorAnnoBtn.addActionListener(e -> {
+            Color picked = JColorChooser.showDialog(snapFrame, "Annotation Color",
+                    annotationOverlay.getAnnotationColor());
+            if (picked != null) {
+                annotationOverlay.setAnnotationColor(picked);
+                colorAnnoBtn.setForeground(picked);
+            }
+        });
+
+        snapToolbar.add(rectBtn);
+        snapToolbar.add(arrowBtn);
+        snapToolbar.add(colorAnnoBtn);
+        snapToolbar.add(undoAnnoBtn);
+        snapToolbar.add(clearAnnoBtn);
+
+        JSeparator saveSep = new JSeparator(SwingConstants.VERTICAL);
+        saveSep.setPreferredSize(new Dimension(1, 18));
+        saveSep.setForeground(theme.bodyHint);
+        snapToolbar.add(saveSep);
+
+        JButton saveImageBtn = new JButton("\uD83D\uDCF7 Save Image");
+        saveImageBtn.setFont(theme.editorFont.deriveFont(10f));
+        saveImageBtn.setBackground(theme.searchFieldBg);
+        saveImageBtn.setForeground(theme.isDark() ? new Color(94, 234, 212) : new Color(22, 128, 96));
+        saveImageBtn.setFocusPainted(false);
+        saveImageBtn.setMargin(new Insets(2, 8, 2, 8));
+        saveImageBtn.setToolTipText("Save screenshot as PNG image (with annotations)");
+        snapToolbar.add(saveImageBtn);
+
+        JButton clipImageBtn = new JButton("\uD83D\uDCCB Clipboard");
+        clipImageBtn.setFont(theme.editorFont.deriveFont(10f));
+        clipImageBtn.setBackground(theme.searchFieldBg);
+        clipImageBtn.setForeground(theme.isDark() ? new Color(124, 211, 255) : new Color(0, 105, 170));
+        clipImageBtn.setFocusPainted(false);
+        clipImageBtn.setMargin(new Insets(2, 8, 2, 8));
+        clipImageBtn.setToolTipText("Copy screenshot to clipboard (with annotations)");
+        snapToolbar.add(clipImageBtn);
 
         // ── Status bar ──
         JPanel snapStatus = new JPanel(new BorderLayout());
@@ -2474,12 +2962,164 @@ public class ProColorEditor {
         JPanel topBar = new JPanel(new BorderLayout());
         topBar.add(snapToolbar, BorderLayout.CENTER);
 
+        // ── Layered pane: split + annotation overlay ──
+        JLayeredPane layeredPane = new JLayeredPane();
+        layeredPane.setLayout(null); // manual layout to stack components
+        layeredPane.add(split, JLayeredPane.DEFAULT_LAYER);
+        layeredPane.add(annotationOverlay, JLayeredPane.PALETTE_LAYER);
+
+        // Keep both layers sized to match the layered pane
+        JPanel centerWrapper = new JPanel(new BorderLayout()) {
+            @Override
+            public void doLayout() {
+                super.doLayout();
+                Dimension sz = layeredPane.getSize();
+                split.setBounds(0, 0, sz.width, sz.height);
+                annotationOverlay.setBounds(0, 0, sz.width, sz.height);
+            }
+        };
+        centerWrapper.add(layeredPane, BorderLayout.CENTER);
+        // Forward resize events
+        layeredPane.addComponentListener(new java.awt.event.ComponentAdapter() {
+            @Override
+            public void componentResized(java.awt.event.ComponentEvent e) {
+                Dimension sz = layeredPane.getSize();
+                split.setBounds(0, 0, sz.width, sz.height);
+                annotationOverlay.setBounds(0, 0, sz.width, sz.height);
+            }
+        });
+
+        // Save Image action — captures the layered pane (split + annotations) as PNG
+        saveImageBtn.addActionListener(e -> {
+            // Temporarily deselect drawing tool so crosshair doesn't show
+            AnnotationPanel.Tool prevTool = annotationOverlay.getTool();
+            annotationOverlay.setTool(AnnotationPanel.Tool.NONE);
+            updateToolButtons.run();
+
+            try {
+                // Capture the content area (split + annotation overlay)
+                int cw = layeredPane.getWidth();
+                int ch = layeredPane.getHeight();
+                if (cw <= 0 || ch <= 0) { info("Nothing to capture."); return; }
+
+                java.awt.image.BufferedImage img = new java.awt.image.BufferedImage(
+                        cw, ch, java.awt.image.BufferedImage.TYPE_INT_ARGB);
+                Graphics2D g2 = img.createGraphics();
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_LCD_HRGB);
+
+                // Paint split pane first
+                split.paint(g2);
+                // Paint annotations on top
+                annotationOverlay.paint(g2);
+                g2.dispose();
+
+                // File chooser
+                JFileChooser fc = new JFileChooser();
+                fc.setDialogTitle("Save Snap Image");
+                fc.setSelectedFile(new File("snap-screenshot.png"));
+                fc.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter("PNG Image", "png"));
+                if (fc.showSaveDialog(frameRef) == JFileChooser.APPROVE_OPTION) {
+                    File file = fc.getSelectedFile();
+                    if (!file.getName().toLowerCase().endsWith(".png")) {
+                        file = new File(file.getAbsolutePath() + ".png");
+                    }
+                    javax.imageio.ImageIO.write(img, "PNG", file);
+                    snapInfo.setText("  Saved: " + file.getName() + "  |  Pro Color View");
+                }
+            } catch (Exception ex) {
+                info("Error saving image: " + ex.getMessage());
+            } finally {
+                // Restore previous tool
+                annotationOverlay.setTool(prevTool);
+                updateToolButtons.run();
+            }
+        });
+
+        // Clipboard action — copies snap image to system clipboard
+        clipImageBtn.addActionListener(e -> {
+            AnnotationPanel.Tool prevTool = annotationOverlay.getTool();
+            annotationOverlay.setTool(AnnotationPanel.Tool.NONE);
+            updateToolButtons.run();
+            try {
+                int cw2 = layeredPane.getWidth();
+                int ch2 = layeredPane.getHeight();
+                if (cw2 <= 0 || ch2 <= 0) { info("Nothing to capture."); return; }
+
+                java.awt.image.BufferedImage img = new java.awt.image.BufferedImage(
+                        cw2, ch2, java.awt.image.BufferedImage.TYPE_INT_ARGB);
+                Graphics2D g2 = img.createGraphics();
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_LCD_HRGB);
+                split.paint(g2);
+                annotationOverlay.paint(g2);
+                g2.dispose();
+
+                // Copy to clipboard using Transferable
+                java.awt.datatransfer.Transferable transferable = new java.awt.datatransfer.Transferable() {
+                    @Override
+                    public java.awt.datatransfer.DataFlavor[] getTransferDataFlavors() {
+                        return new java.awt.datatransfer.DataFlavor[]{java.awt.datatransfer.DataFlavor.imageFlavor};
+                    }
+                    @Override
+                    public boolean isDataFlavorSupported(java.awt.datatransfer.DataFlavor flavor) {
+                        return java.awt.datatransfer.DataFlavor.imageFlavor.equals(flavor);
+                    }
+                    @Override
+                    public Object getTransferData(java.awt.datatransfer.DataFlavor flavor) {
+                        return img;
+                    }
+                };
+                Toolkit.getDefaultToolkit().getSystemClipboard().setContents(transferable, null);
+                snapInfo.setText("  Copied to clipboard!  |  Pro Color View");
+            } catch (Exception ex) {
+                info("Error copying to clipboard: " + ex.getMessage());
+            } finally {
+                annotationOverlay.setTool(prevTool);
+                updateToolButtons.run();
+            }
+        });
+
         snapFrame.getContentPane().setBackground(theme.bg);
         snapFrame.add(topBar, BorderLayout.NORTH);
-        snapFrame.add(split, BorderLayout.CENTER);
+        snapFrame.add(centerWrapper, BorderLayout.CENTER);
         snapFrame.add(snapStatus, BorderLayout.SOUTH);
         snapFrame.setSize(w, h);
         snapFrame.setLocationRelativeTo(null);
+
+        // ── Snap keyboard shortcuts ──
+        JRootPane snapRoot = snapFrame.getRootPane();
+        InputMap snapIm = snapRoot.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW);
+        ActionMap snapAm = snapRoot.getActionMap();
+        // R = toggle Rectangle tool
+        snapIm.put(KeyStroke.getKeyStroke(KeyEvent.VK_R, 0), "snapRect");
+        snapAm.put("snapRect", new AbstractAction() {
+            @Override public void actionPerformed(ActionEvent ev) {
+                rectBtn.doClick();
+            }
+        });
+        // A = toggle Arrow tool
+        snapIm.put(KeyStroke.getKeyStroke(KeyEvent.VK_A, 0), "snapArrow");
+        snapAm.put("snapArrow", new AbstractAction() {
+            @Override public void actionPerformed(ActionEvent ev) {
+                arrowBtn.doClick();
+            }
+        });
+        // Escape = deselect tool
+        snapIm.put(KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), "snapEscTool");
+        snapAm.put("snapEscTool", new AbstractAction() {
+            @Override public void actionPerformed(ActionEvent ev) {
+                annotationOverlay.setTool(AnnotationPanel.Tool.NONE);
+                updateToolButtons.run();
+            }
+        });
+        // Ctrl+Shift+C / Cmd+Shift+C = copy screenshot to clipboard
+        snapIm.put(KeyStroke.getKeyStroke(KeyEvent.VK_C, MOD | InputEvent.SHIFT_DOWN_MASK), "snapClipboard");
+        snapAm.put("snapClipboard", new AbstractAction() {
+            @Override public void actionPerformed(ActionEvent ev) {
+                clipImageBtn.doClick();
+            }
+        });
 
         // Apply initial overlays from current editor fields, then show
         applySnapOverlaysAction.run();
@@ -2607,7 +3247,8 @@ public class ProColorEditor {
     /**
      * Minimize Headers: lets user toggle which headers are visible.
      * Hidden headers are stored and can be restored by running minimize again.
-     * Works on both requests and responses in the main editor.
+     * Works on both requests and responses. Also shows companion headers (response)
+     * when available, so both can be minimized/restored in one dialog.
      */
     private void minimizeHeaders() {
         if (lastParsed == null) { info("No content to minimize."); return; }
@@ -2627,10 +3268,16 @@ public class ProColorEditor {
 
         if (originalHeaders.isEmpty()) { info("No headers to minimize."); return; }
 
-        // Build dialog — always show ALL original headers
+        // Build primary header checkboxes
         JPanel checkPanel = new JPanel();
         checkPanel.setLayout(new BoxLayout(checkPanel, BoxLayout.Y_AXIS));
         List<JCheckBox> checks = new ArrayList<>();
+
+        JLabel primaryLabel = new JLabel("  \u2500\u2500 " + label.toUpperCase() + " HEADERS \u2500\u2500");
+        primaryLabel.setFont(new Font(Font.MONOSPACED, Font.BOLD, 11));
+        primaryLabel.setForeground(new Color(124, 211, 255));
+        checkPanel.add(primaryLabel);
+        checkPanel.add(Box.createVerticalStrut(4));
 
         for (var header : originalHeaders) {
             String name = header.getKey();
@@ -2640,7 +3287,6 @@ public class ProColorEditor {
             boolean isHidden = hiddenHeaderKeys.contains(nameLower);
 
             JCheckBox cb = new JCheckBox(name + ": " + truncate(header.getValue(), 60));
-            // If already hidden, keep unchecked; if first time, use noise/essential logic
             if (isHidden) {
                 cb.setSelected(false);
             } else {
@@ -2649,27 +3295,89 @@ public class ProColorEditor {
             cb.setFont(new Font(Font.MONOSPACED, isEssential ? Font.BOLD : Font.PLAIN, 11));
             if (isNoise) cb.setForeground(Color.GRAY);
             if (isEssential) cb.setForeground(new Color(100, 200, 100));
-            if (isHidden) cb.setForeground(new Color(255, 160, 80)); // orange = currently hidden
+            if (isHidden) cb.setForeground(new Color(255, 160, 80));
             checks.add(cb);
             checkPanel.add(cb);
         }
 
+        // Companion (response/request) headers section
+        boolean hasCompanion = companionParsed != null && companionParsed.headers() != null
+                && !companionParsed.headers().isEmpty();
+        List<JCheckBox> companionChecks = new ArrayList<>();
+
+        if (hasCompanion) {
+            boolean compIsReq = companionParsed.isRequest();
+            Set<String> compNoise = compIsReq ? NOISE_HEADERS_REQ : NOISE_HEADERS_RES;
+            Set<String> compEssential = compIsReq ? ESSENTIAL_HEADERS_REQ : ESSENTIAL_HEADERS_RES;
+            String compLabel = compIsReq ? "REQUEST" : "RESPONSE";
+
+            // Initialize companion minimize state
+            if (companionOriginalHeaders == null) {
+                companionOriginalHeaders = new ArrayList<>(companionParsed.headers());
+                companionOriginalStartLine = companionParsed.startLine();
+                companionOriginalBody = companionParsed.rawBody();
+                companionHiddenHeaderKeys = new java.util.HashSet<>();
+            }
+
+            checkPanel.add(Box.createVerticalStrut(10));
+            JSeparator sep = new JSeparator();
+            sep.setMaximumSize(new Dimension(Integer.MAX_VALUE, 1));
+            checkPanel.add(sep);
+            checkPanel.add(Box.createVerticalStrut(4));
+
+            JLabel compLabelWidget = new JLabel("  \u2500\u2500 " + compLabel + " HEADERS \u2500\u2500");
+            compLabelWidget.setFont(new Font(Font.MONOSPACED, Font.BOLD, 11));
+            compLabelWidget.setForeground(new Color(134, 239, 172));
+            checkPanel.add(compLabelWidget);
+            checkPanel.add(Box.createVerticalStrut(4));
+
+            for (var header : companionOriginalHeaders) {
+                String name = header.getKey();
+                String nameLower = name.toLowerCase();
+                boolean isEss = compEssential.contains(nameLower);
+                boolean isNoi = compNoise.contains(nameLower);
+                boolean isHid = companionHiddenHeaderKeys.contains(nameLower);
+
+                JCheckBox cb = new JCheckBox(name + ": " + truncate(header.getValue(), 60));
+                if (isHid) {
+                    cb.setSelected(false);
+                } else {
+                    cb.setSelected(isEss || !isNoi);
+                }
+                cb.setFont(new Font(Font.MONOSPACED, isEss ? Font.BOLD : Font.PLAIN, 11));
+                if (isNoi) cb.setForeground(Color.GRAY);
+                if (isEss) cb.setForeground(new Color(100, 200, 100));
+                if (isHid) cb.setForeground(new Color(255, 160, 80));
+                companionChecks.add(cb);
+                checkPanel.add(cb);
+            }
+        }
+
+        // All checks combined for button actions
+        List<JCheckBox> allChecks = new ArrayList<>(checks);
+        allChecks.addAll(companionChecks);
+
         JPanel btnPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 2));
         JButton selectAll = new JButton("Show All");
-        selectAll.addActionListener(e -> checks.forEach(cb -> cb.setSelected(true)));
+        selectAll.addActionListener(e -> allChecks.forEach(cb -> cb.setSelected(true)));
         JButton selectNone = new JButton("Hide All");
-        selectNone.addActionListener(e -> checks.forEach(cb -> cb.setSelected(false)));
+        selectNone.addActionListener(e -> allChecks.forEach(cb -> cb.setSelected(false)));
         JButton selectEssential = new JButton("Only Essential");
         selectEssential.addActionListener(e -> {
             for (int i = 0; i < checks.size(); i++) {
                 String hName = originalHeaders.get(i).getKey().toLowerCase();
                 checks.get(i).setSelected(essentialSet.contains(hName));
             }
+            if (hasCompanion) {
+                Set<String> compEss = companionParsed.isRequest() ? ESSENTIAL_HEADERS_REQ : ESSENTIAL_HEADERS_RES;
+                for (int i = 0; i < companionChecks.size(); i++) {
+                    String hName = companionOriginalHeaders.get(i).getKey().toLowerCase();
+                    companionChecks.get(i).setSelected(compEss.contains(hName));
+                }
+            }
         });
         JButton restoreAll = new JButton("Restore All");
-        restoreAll.addActionListener(e -> {
-            checks.forEach(cb -> cb.setSelected(true));
-        });
+        restoreAll.addActionListener(e -> allChecks.forEach(cb -> cb.setSelected(true)));
         btnPanel.add(selectAll);
         btnPanel.add(selectNone);
         btnPanel.add(selectEssential);
@@ -2678,19 +3386,21 @@ public class ProColorEditor {
         JPanel mainP = new JPanel(new BorderLayout(0, 4));
         mainP.add(btnPanel, BorderLayout.NORTH);
         JScrollPane sp = new JScrollPane(checkPanel);
-        sp.setPreferredSize(new Dimension(520, 320));
+        sp.setPreferredSize(new Dimension(520, hasCompanion ? 450 : 320));
         mainP.add(sp, BorderLayout.CENTER);
 
         JLabel hint = new JLabel("Green = essential | Gray = noise | Orange = currently hidden. Uncheck to hide, check to restore.");
         hint.setFont(hint.getFont().deriveFont(Font.ITALIC, 10f));
         mainP.add(hint, BorderLayout.SOUTH);
 
+        String title = hasCompanion
+                ? "Minimize Headers — Request + Response"
+                : "Minimize " + label + " — Toggle Header Visibility";
         int result = JOptionPane.showConfirmDialog(mainPanel, mainP,
-                "Minimize " + label + " — Toggle Header Visibility",
-                JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
+                title, JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
         if (result != JOptionPane.OK_OPTION) return;
 
-        // Update hidden set based on user selection
+        // Update primary editor hidden set
         hiddenHeaderKeys.clear();
         for (int i = 0; i < checks.size(); i++) {
             if (!checks.get(i).isSelected()) {
@@ -2698,7 +3408,7 @@ public class ProColorEditor {
             }
         }
 
-        // Rebuild message showing only visible headers
+        // Rebuild primary editor message
         StringBuilder sb = new StringBuilder();
         sb.append(originalStartLine).append("\r\n");
         int shown = 0;
@@ -2713,7 +3423,42 @@ public class ProColorEditor {
 
         setEditorText(sb.toString());
         int hidden = originalHeaders.size() - shown;
-        searchStatus.setText(label + ": " + shown + " visible, " + hidden + " hidden (run again to restore)");
+
+        // Update companion if present
+        if (hasCompanion && !companionChecks.isEmpty()) {
+            companionHiddenHeaderKeys.clear();
+            for (int i = 0; i < companionChecks.size(); i++) {
+                if (!companionChecks.get(i).isSelected()) {
+                    companionHiddenHeaderKeys.add(companionOriginalHeaders.get(i).getKey().toLowerCase());
+                }
+            }
+
+            StringBuilder csb = new StringBuilder();
+            csb.append(companionOriginalStartLine).append("\r\n");
+            int compShown = 0;
+            for (var h : companionOriginalHeaders) {
+                if (!companionHiddenHeaderKeys.contains(h.getKey().toLowerCase())) {
+                    csb.append(h.getKey()).append(": ").append(h.getValue()).append("\r\n");
+                    compShown++;
+                }
+            }
+            csb.append("\r\n");
+            if (companionOriginalBody != null && !companionOriginalBody.isEmpty()) csb.append(companionOriginalBody);
+
+            // Update companion content and re-parse
+            String compText = csb.toString();
+            this.companionContent = compText.getBytes();
+            try {
+                this.companionParsed = HttpMessageParser.parse(compText, companionIsRequest);
+            } catch (Exception ignored) {}
+
+            int compHidden = companionOriginalHeaders.size() - compShown;
+            String compLabel = companionIsRequest ? "Request" : "Response";
+            searchStatus.setText(label + ": " + shown + " visible, " + hidden + " hidden | "
+                    + compLabel + ": " + compShown + " visible, " + compHidden + " hidden");
+        } else {
+            searchStatus.setText(label + ": " + shown + " visible, " + hidden + " hidden (run again to restore)");
+        }
     }
 
     private static String truncate(String s, int max) {
@@ -2728,8 +3473,8 @@ public class ProColorEditor {
         JPanel panel = new JPanel(new BorderLayout());
         panel.setBackground(theme.bg);
 
-        Color labelFg = theme.isDark() ? new Color(120, 180, 255) : new Color(30, 90, 180);
-        Color labelBg = theme.isDark() ? new Color(35, 40, 50) : new Color(230, 238, 250);
+        Color labelFg = Color.WHITE;
+        Color labelBg = theme.isDark() ? new Color(50, 60, 80) : new Color(60, 100, 180);
 
         JPanel header = new JPanel(new BorderLayout());
         header.setBackground(labelBg);
@@ -2737,7 +3482,7 @@ public class ProColorEditor {
 
         // Label del tipo (REQUEST / RESPONSE)
         JLabel label = new JLabel("  " + labelText + "  ");
-        label.setFont(theme.editorFont.deriveFont(Font.BOLD, 10.5f));
+        label.setFont(theme.editorFont.deriveFont(Font.BOLD, 14f));
         label.setForeground(labelFg);
         label.setOpaque(false);
         header.add(label, BorderLayout.WEST);
@@ -2746,7 +3491,7 @@ public class ProColorEditor {
             // JTextArea para word-wrap automático en endpoints largos
             JTextArea epArea = new JTextArea(endpoint);
             epArea.setFont(theme.editorFont.deriveFont(Font.PLAIN, 10f));
-            epArea.setForeground(theme.isDark() ? new Color(170, 200, 230) : new Color(60, 100, 160));
+            epArea.setForeground(new Color(210, 225, 245));
             epArea.setBackground(labelBg);
             epArea.setEditable(false);
             epArea.setLineWrap(true);
@@ -3051,6 +3796,7 @@ public class ProColorEditor {
         bind(im, am, KeyEvent.VK_B, MOD, "togglePretty", this::togglePretty);
         bind(im, am, KeyEvent.VK_S, MOD, "export", this::exportToFile);
         bind(im, am, KeyEvent.VK_T, MOD, "varsManager", this::openTemplateVarsManager);
+        // AI panel toggle is handled globally via AWTEventListener (Shift+Option+X / Shift+Ctrl+X)
     }
     private void bindEditorShortcuts() {
         InputMap im = editor.getInputMap(JComponent.WHEN_FOCUSED);
@@ -3070,6 +3816,54 @@ public class ProColorEditor {
         am.put(name, new AbstractAction() {
             @Override public void actionPerformed(ActionEvent e) { action.run(); }
         });
+    }
+
+    // ── Cleanup (prevents memory leaks on editor disposal) ────────
+
+    /**
+     * Release all resources held by this editor.
+     * Call when the editor is no longer needed (e.g., tab closed, extension unloaded).
+     */
+    public void cleanup() {
+        // 1. Cancel any pending async render
+        if (asyncRenderWorker != null && !asyncRenderWorker.isDone()) {
+            asyncRenderWorker.cancel(true);
+            asyncRenderWorker = null;
+        }
+
+        // 2. Stop feedback timer
+        if (feedbackTimer != null) {
+            feedbackTimer.stop();
+            feedbackTimer = null;
+        }
+
+        // 3. Remove document listeners from current document
+        Document doc = editor.getDocument();
+        if (doc instanceof javax.swing.text.DefaultStyledDocument sDoc) {
+            sDoc.removeUndoableEditListener(undoManager);
+            sDoc.removeDocumentListener(docModListener);
+            if (lineGutter != null) sDoc.removeDocumentListener(lineGutter);
+        }
+
+        // 4. Clear undo history
+        undoManager.discardAllEdits();
+
+        // 5. Clear document cache (releases styled documents and their associated resources)
+        docCache.clear();
+
+        // 6. Cleanup AI panel
+        if (aiPanel != null) {
+            aiPanel.cleanup();
+        }
+
+        // 7. Clear references to prevent GC roots
+        currentContent = null;
+        lastParsed = null;
+        companionContent = null;
+        companionParsed = null;
+        originalHeaders = null;
+        companionOriginalHeaders = null;
+        originalService = null;
     }
 
     // ── Helpers ─────────────────────────────────────────────────────

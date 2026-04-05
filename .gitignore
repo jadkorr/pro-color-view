@@ -21,10 +21,7 @@ gradlew.bat
 Thumbs.db
 
 # Old JAR versions (keep only the latest release)
-pro-color-view-4.3.*.jar
-pro-color-view-4.2.*.jar
-pro-color-view-4.1.*.jar
-pro-color-view-4.0.*.jar
+pro-color-view-4.*.jar
 pro-color-view-3.*.jar
 pro-color-view-2.*.jar
 pro-color-view-1.*.jar

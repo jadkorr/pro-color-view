@@ -34,6 +34,8 @@ public class TemplateVars {
 
     /** Prefix for persisted variable keys */
     private static final String PERSIST_PREFIX = "pcv_var_";
+    /** Key for persisted variable ordering */
+    private static final String ORDER_KEY = "pcv_var__order_";
 
     /** Reference to Burp API for persistence (set once at init) */
     private static MontoyaApi burpApi;
@@ -46,40 +48,61 @@ public class TemplateVars {
         loadFromProject();
     }
 
-    /** Load all variables from the Burp project's extension data. */
+    /** Load all variables from the Burp project's extension data, preserving insertion order. */
     private static void loadFromProject() {
         if (burpApi == null) return;
         try {
             PersistedObject data = burpApi.persistence().extensionData();
+
+            // First, load all var values into a temporary map
+            Map<String, String> allVars = new LinkedHashMap<>();
             for (String key : data.stringKeys()) {
-                if (key.startsWith(PERSIST_PREFIX)) {
+                if (key.startsWith(PERSIST_PREFIX) && !key.equals(ORDER_KEY)) {
                     String varName = key.substring(PERSIST_PREFIX.length());
                     String value = data.getString(key);
                     if (value != null) {
-                        VARS.put(varName, value);
+                        allVars.put(varName, value);
                     }
                 }
             }
+
+            // Then, apply ordering from the saved order key
+            String orderStr = data.getString(ORDER_KEY);
+            if (orderStr != null && !orderStr.isEmpty()) {
+                String[] orderedNames = orderStr.split("\n");
+                for (String name : orderedNames) {
+                    if (allVars.containsKey(name)) {
+                        VARS.put(name, allVars.remove(name));
+                    }
+                }
+            }
+            // Add any remaining vars not in the order list (backwards compatibility)
+            VARS.putAll(allVars);
         } catch (Exception ignored) {
             // If persistence not available, continue with empty vars
         }
     }
 
-    /** Save all current variables to the Burp project's extension data. */
+    /** Save all current variables to the Burp project's extension data, preserving order. */
     private static void saveToProject() {
         if (burpApi == null) return;
         try {
             PersistedObject data = burpApi.persistence().extensionData();
             // Remove old persisted vars
             for (String key : new java.util.ArrayList<>(data.stringKeys())) {
-                if (key.startsWith(PERSIST_PREFIX)) {
+                if (key.startsWith(PERSIST_PREFIX) || key.equals(ORDER_KEY)) {
                     data.deleteString(key);
                 }
             }
             // Write current vars
+            StringBuilder orderBuilder = new StringBuilder();
             for (Map.Entry<String, String> e : VARS.entrySet()) {
                 data.setString(PERSIST_PREFIX + e.getKey(), e.getValue());
+                if (orderBuilder.length() > 0) orderBuilder.append("\n");
+                orderBuilder.append(e.getKey());
             }
+            // Save ordering
+            data.setString(ORDER_KEY, orderBuilder.toString());
         } catch (Exception ignored) {
             // Best effort persistence
         }
@@ -337,10 +360,15 @@ public class TemplateVars {
             if (insertCallback == null) return;
             int row = table.getSelectedRow();
             if (row < 0) return;
+            // Save current table state before closing
+            if (table.isEditing()) table.getCellEditor().stopCellEditing();
+            saveTableToVars(model);
             Object nameObj = model.getValueAt(row, 0);
             if (nameObj != null && !nameObj.toString().trim().isEmpty()) {
                 insertCallback.accept("{{" + nameObj.toString().trim() + "}}");
             }
+            // Auto-close dialog
+            closeParentDialog(table);
         });
 
         JButton insertValBtn = new JButton("Insert Value");
@@ -350,10 +378,15 @@ public class TemplateVars {
             if (insertCallback == null) return;
             int row = table.getSelectedRow();
             if (row < 0) return;
+            // Save current table state before closing
+            if (table.isEditing()) table.getCellEditor().stopCellEditing();
+            saveTableToVars(model);
             Object valObj = model.getValueAt(row, 1);
             if (valObj != null && !valObj.toString().isEmpty()) {
                 insertCallback.accept(valObj.toString());
             }
+            // Auto-close dialog
+            closeParentDialog(table);
         });
 
         // Enable insert buttons when a row is selected
@@ -403,6 +436,29 @@ public class TemplateVars {
             return true;
         }
         return false;
+    }
+
+    /** Save table contents to VARS map */
+    private static void saveTableToVars(javax.swing.table.DefaultTableModel model) {
+        java.util.Map<String, String> newVars = new java.util.LinkedHashMap<>();
+        for (int r = 0; r < model.getRowCount(); r++) {
+            Object nameObj = model.getValueAt(r, 0);
+            Object valObj  = model.getValueAt(r, 1);
+            String name = nameObj != null ? nameObj.toString().trim() : "";
+            String val  = valObj != null ? valObj.toString() : "";
+            if (!name.isEmpty()) {
+                newVars.put(name, val);
+            }
+        }
+        replaceAll(newVars);
+    }
+
+    /** Close the JOptionPane dialog that contains this component */
+    private static void closeParentDialog(java.awt.Component comp) {
+        java.awt.Window win = javax.swing.SwingUtilities.getWindowAncestor(comp);
+        if (win instanceof java.awt.Dialog) {
+            win.dispose();
+        }
     }
 
     /** Quick-set dialog: set a single variable from selected text */

@@ -5,6 +5,8 @@ import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.logging.Logging;
 import com.procolorview.editor.ProColorRequestEditorProvider;
 import com.procolorview.editor.ProColorResponseEditorProvider;
+import com.procolorview.ai.AiConfig;
+import com.procolorview.util.ColorConfig;
 import com.procolorview.util.TemplateVars;
 
 /**
@@ -26,7 +28,7 @@ import com.procolorview.util.TemplateVars;
 public class ProColorExtension implements BurpExtension {
 
     private static final String NAME = "Pro Color View";
-    private static final String VERSION = "2.0.0";
+    private static final String VERSION = "5.0.0";
 
     @Override
     public void initialize(MontoyaApi api) {
@@ -34,8 +36,10 @@ public class ProColorExtension implements BurpExtension {
 
         api.extension().setName(NAME);
 
-        // Initialize template variables with persistence
+        // Initialize template variables, color config, and AI config with persistence
         TemplateVars.init(api);
+        ColorConfig.init(api);
+        AiConfig.init(api);
 
         // Registrar providers para Request y Response
         api.userInterface().registerHttpRequestEditorProvider(

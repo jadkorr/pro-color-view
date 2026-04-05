@@ -29,7 +29,8 @@ public final class JsColorizer {
 
     private JsColorizer() {}
 
-    private static final int MAX_COLORIZE_LENGTH = 500_000; // 500KB limit
+    private static final int MAX_COLORIZE_LENGTH = 200_000; // 200KB limit for full colorization
+    private static final int BATCH_SIZE = 512; // Flush buffer every N chars to reduce insertString calls
 
     private static final Set<String> KEYWORDS = Set.of(
             "abstract", "arguments", "async", "await", "break", "case", "catch",
@@ -59,9 +60,14 @@ public final class JsColorizer {
     private static final String OPERATORS = "{}()[];,.=><!&|?:+-*/%^~";
 
     public static void colorize(StyledDocument doc, String js, ProColorTheme theme) throws Exception {
-        // Safety: skip colorization for very large JS (StyledDocument is too slow)
-        if (js.length() > MAX_COLORIZE_LENGTH) {
+        // Very large JS (>1MB): plain text, no colorization
+        if (js.length() > 1_000_000) {
             append(doc, js, style(theme.fg, false));
+            return;
+        }
+        // Large JS (200KB-1MB): partial colorization (strings, comments, keywords only)
+        if (js.length() > MAX_COLORIZE_LENGTH) {
+            colorizePartial(doc, js, theme);
             return;
         }
 
@@ -255,5 +261,73 @@ public final class JsColorizer {
             append(doc, buf.toString(), style);
             buf.setLength(0);
         }
+    }
+
+    /**
+     * Fast partial colorization for large JS (between MAX_COLORIZE_LENGTH and 1MB).
+     * Only colorizes strings, comments, and keywords — skips fine-grained token analysis.
+     */
+    private static void colorizePartial(StyledDocument doc, String js, ProColorTheme theme) throws Exception {
+        boolean isDark = theme.isDark();
+        SimpleAttributeSet keywordStyle = style(isDark ? new Color(198, 120, 221) : new Color(152, 50, 170), true);
+        SimpleAttributeSet stringStyle  = style(theme.jsonString, false);
+        SimpleAttributeSet commentStyle = style(isDark ? new Color(106, 115, 125) : new Color(140, 140, 140), false);
+        SimpleAttributeSet defaultStyle = style(theme.fg, false);
+
+        int len = js.length();
+        int i = 0;
+        StringBuilder buf = new StringBuilder(BATCH_SIZE * 2);
+
+        while (i < len) {
+            char c = js.charAt(i);
+
+            // Comments
+            if (c == '/' && i + 1 < len) {
+                char n = js.charAt(i + 1);
+                if (n == '/') {
+                    flushBuf(doc, buf, defaultStyle);
+                    int end = js.indexOf('\n', i);
+                    if (end < 0) end = len;
+                    append(doc, js.substring(i, end), commentStyle);
+                    i = end; continue;
+                }
+                if (n == '*') {
+                    flushBuf(doc, buf, defaultStyle);
+                    int end = js.indexOf("*/", i + 2);
+                    end = (end < 0) ? len : end + 2;
+                    append(doc, js.substring(i, Math.min(end, len)), commentStyle);
+                    i = Math.min(end, len); continue;
+                }
+            }
+
+            // Strings
+            if (c == '"' || c == '\'' || c == '`') {
+                flushBuf(doc, buf, defaultStyle);
+                int end = scanString(js, i, c);
+                append(doc, js.substring(i, end), stringStyle);
+                i = end; continue;
+            }
+
+            // Keywords (quick check)
+            if (isIdentStart(c)) {
+                int end = i + 1;
+                while (end < len && isIdentPart(js.charAt(end))) end++;
+                String word = js.substring(i, end);
+                if (KEYWORDS.contains(word)) {
+                    flushBuf(doc, buf, defaultStyle);
+                    append(doc, word, keywordStyle);
+                } else {
+                    buf.append(word);
+                }
+                i = end; continue;
+            }
+
+            buf.append(c);
+            if (buf.length() >= BATCH_SIZE) {
+                flushBuf(doc, buf, defaultStyle);
+            }
+            i++;
+        }
+        flushBuf(doc, buf, defaultStyle);
     }
 }

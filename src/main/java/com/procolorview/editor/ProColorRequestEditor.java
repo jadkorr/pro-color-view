@@ -26,7 +26,12 @@ public class ProColorRequestEditor implements ExtensionProvidedHttpRequestEditor
     @Override
     public HttpRequest getRequest() {
         if (editor.isModified()) {
-            return HttpRequest.httpRequest(new String(editor.getContent()));
+            HttpRequest req = HttpRequest.httpRequest(new String(editor.getContent()));
+            // Preserve the original HttpService (host/port/https)
+            if (currentRequest != null && currentRequest.httpService() != null) {
+                req = req.withService(currentRequest.httpService());
+            }
+            return req;
         }
         return currentRequest;
     }

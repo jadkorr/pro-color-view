@@ -14,11 +14,12 @@ public record ParsedHttpMessage(
         List<Map.Entry<String, String>> headers,
         BodyType bodyType,
         String prettyBody,
-        boolean isRequest
+        boolean isRequest,
+        int originalBodySize
 ) {
 
     public enum BodyType {
-        JSON, XML, HTML, JAVASCRIPT, FORM, NONE
+        JSON, XML, HTML, JAVASCRIPT, FORM, BINARY, NONE
     }
 
     public boolean hasBody() {

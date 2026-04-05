@@ -28,8 +28,16 @@ public final class HttpMessageParser {
      * Parsea un mensaje HTTP crudo.
      */
     public static ParsedHttpMessage parse(String raw, boolean isRequest) {
+        return parse(raw, isRequest, -1);
+    }
+
+    /**
+     * Parsea un mensaje HTTP crudo, with optional real body size hint for pre-truncated binary content.
+     * @param realBodySize if >= 0, used as the original body size instead of body.length() (for binary fast-path)
+     */
+    public static ParsedHttpMessage parse(String raw, boolean isRequest, int realBodySize) {
         if (raw == null || raw.isEmpty()) {
-            return new ParsedHttpMessage("", "", "", List.of(), BodyType.NONE, "", isRequest);
+            return new ParsedHttpMessage("", "", "", List.of(), BodyType.NONE, "", isRequest, 0);
         }
 
         String[] parts = splitHeadBody(raw);
@@ -53,9 +61,17 @@ public final class HttpMessageParser {
         }
 
         BodyType bodyType = detectBodyType(headers, body);
+        int originalBodySize = (realBodySize >= 0) ? realBodySize : body.length();
+
+        // For binary content, truncate body early — keep only first 128 chars for hex preview
+        // This avoids storing megabytes of binary data as String in memory
+        if (bodyType == BodyType.BINARY && body.length() > 256) {
+            body = body.substring(0, 128);
+        }
+
         String prettyBody = prettify(body, bodyType);
 
-        return new ParsedHttpMessage(head, body, startLine, headers, bodyType, prettyBody, isRequest);
+        return new ParsedHttpMessage(head, body, startLine, headers, bodyType, prettyBody, isRequest, originalBodySize);
     }
 
     /**
@@ -96,6 +112,14 @@ public final class HttpMessageParser {
                 if (ct.contains("html")) return BodyType.HTML;
                 if (ct.contains("javascript") || ct.contains("ecmascript")) return BodyType.JAVASCRIPT;
                 if (ct.contains("x-www-form-urlencoded")) return BodyType.FORM;
+                // Binary content types — skip body processing entirely
+                if (ct.contains("pdf") || ct.contains("image/") || ct.contains("octet-stream")
+                        || ct.contains("video/") || ct.contains("audio/") || ct.contains("font/")
+                        || ct.contains("zip") || ct.contains("gzip") || ct.contains("woff")
+                        || ct.contains("protobuf") || ct.contains("grpc")
+                        || ct.contains("application/x-shockwave") || ct.contains("wasm")) {
+                    return BodyType.BINARY;
+                }
             }
         }
 
@@ -119,6 +143,7 @@ public final class HttpMessageParser {
 
         return switch (type) {
             case JSON -> prettifyJson(body);
+            case BINARY -> ""; // Don't prettify binary content
             // FORM: keep raw url-encoded format (key=val&key2=val2) — no prettification
             default -> body;
         };
