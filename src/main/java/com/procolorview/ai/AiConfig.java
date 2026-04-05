@@ -2,6 +2,7 @@ package com.procolorview.ai;
 
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.persistence.PersistedObject;
+import burp.api.montoya.persistence.Preferences;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -18,22 +19,35 @@ public final class AiConfig {
 
     public enum Provider {
         OPENAI("OpenAI (ChatGPT)", "gpt-4o-mini",
-                "https://api.openai.com/v1/chat/completions"),
+                "https://api.openai.com/v1/chat/completions",
+                new String[]{"gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo",
+                             "o1", "o1-mini", "o3-mini"}),
         ANTHROPIC("Anthropic (Claude)", "claude-sonnet-4-20250514",
-                "https://api.anthropic.com/v1/messages"),
+                "https://api.anthropic.com/v1/messages",
+                new String[]{"claude-opus-4-20250514", "claude-sonnet-4-20250514",
+                             "claude-haiku-4-5-20251001", "claude-3-5-sonnet-20241022",
+                             "claude-3-5-haiku-20241022", "claude-3-opus-20240229"}),
         GEMINI("Google Gemini", "gemini-2.0-flash",
-                "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent"),
+                "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent",
+                new String[]{"gemini-2.5-pro-exp-03-25", "gemini-2.0-flash", "gemini-2.0-flash-lite",
+                             "gemini-1.5-pro", "gemini-1.5-flash"}),
         OPENROUTER("OpenRouter", "openai/gpt-4o-mini",
-                "https://openrouter.ai/api/v1/chat/completions");
+                "https://openrouter.ai/api/v1/chat/completions",
+                new String[]{"openai/gpt-4o", "openai/gpt-4o-mini", "anthropic/claude-3.5-sonnet",
+                             "anthropic/claude-3-haiku", "google/gemini-2.0-flash-001",
+                             "meta-llama/llama-3.3-70b-instruct", "deepseek/deepseek-r1",
+                             "deepseek/deepseek-chat"});
 
         public final String displayName;
         public final String defaultModel;
         public final String endpoint;
+        public final String[] models;
 
-        Provider(String displayName, String defaultModel, String endpoint) {
+        Provider(String displayName, String defaultModel, String endpoint, String[] models) {
             this.displayName = displayName;
             this.defaultModel = defaultModel;
             this.endpoint = endpoint;
+            this.models = models;
         }
 
         @Override public String toString() { return displayName; }
@@ -71,18 +85,41 @@ public final class AiConfig {
     private static void loadFromProject() {
         if (burpApi == null) return;
         try {
+            Preferences prefs = burpApi.persistence().preferences();
             PersistedObject data = burpApi.persistence().extensionData();
 
-            // Load API keys and models
+            // Load API keys and models from global preferences (with one-time migration from project data)
             for (Provider p : Provider.values()) {
-                String key = data.getString(KEY_PREFIX + p.name());
+                String key = prefs.getString(KEY_PREFIX + p.name());
+                if (key == null) {
+                    key = data.getString(KEY_PREFIX + p.name());
+                    if (key != null) {
+                        prefs.setString(KEY_PREFIX + p.name(), key);
+                        try { data.deleteString(KEY_PREFIX + p.name()); } catch (Exception ignored) {}
+                    }
+                }
                 if (key != null) API_KEYS.put(p.name(), key);
-                String model = data.getString(MODEL_PREFIX + p.name());
+
+                String model = prefs.getString(MODEL_PREFIX + p.name());
+                if (model == null) {
+                    model = data.getString(MODEL_PREFIX + p.name());
+                    if (model != null) {
+                        prefs.setString(MODEL_PREFIX + p.name(), model);
+                        try { data.deleteString(MODEL_PREFIX + p.name()); } catch (Exception ignored) {}
+                    }
+                }
                 if (model != null) MODELS.put(p.name(), model);
             }
 
-            // Load selected provider
-            String selProv = data.getString(SELECTED_PROV);
+            // Load selected provider from global preferences (with migration)
+            String selProv = prefs.getString(SELECTED_PROV);
+            if (selProv == null) {
+                selProv = data.getString(SELECTED_PROV);
+                if (selProv != null) {
+                    prefs.setString(SELECTED_PROV, selProv);
+                    try { data.deleteString(SELECTED_PROV); } catch (Exception ignored) {}
+                }
+            }
             if (selProv != null) {
                 try { selectedProvider = Provider.valueOf(selProv); }
                 catch (IllegalArgumentException ignored) {}
@@ -201,12 +238,12 @@ Response:
     private static void saveKeys() {
         if (burpApi == null) return;
         try {
-            PersistedObject data = burpApi.persistence().extensionData();
+            Preferences prefs = burpApi.persistence().preferences();
             for (Provider p : Provider.values()) {
                 String val = API_KEYS.get(p.name());
-                if (val != null) data.setString(KEY_PREFIX + p.name(), val);
+                if (val != null) prefs.setString(KEY_PREFIX + p.name(), val);
                 else {
-                    try { data.deleteString(KEY_PREFIX + p.name()); } catch (Exception ignored) {}
+                    try { prefs.deleteString(KEY_PREFIX + p.name()); } catch (Exception ignored) {}
                 }
             }
         } catch (Exception ignored) {}
@@ -215,12 +252,12 @@ Response:
     private static void saveModels() {
         if (burpApi == null) return;
         try {
-            PersistedObject data = burpApi.persistence().extensionData();
+            Preferences prefs = burpApi.persistence().preferences();
             for (Provider p : Provider.values()) {
                 String val = MODELS.get(p.name());
-                if (val != null) data.setString(MODEL_PREFIX + p.name(), val);
+                if (val != null) prefs.setString(MODEL_PREFIX + p.name(), val);
                 else {
-                    try { data.deleteString(MODEL_PREFIX + p.name()); } catch (Exception ignored) {}
+                    try { prefs.deleteString(MODEL_PREFIX + p.name()); } catch (Exception ignored) {}
                 }
             }
         } catch (Exception ignored) {}
@@ -229,7 +266,7 @@ Response:
     private static void saveSelectedProvider() {
         if (burpApi == null) return;
         try {
-            burpApi.persistence().extensionData().setString(SELECTED_PROV, selectedProvider.name());
+            burpApi.persistence().preferences().setString(SELECTED_PROV, selectedProvider.name());
         } catch (Exception ignored) {}
     }
 

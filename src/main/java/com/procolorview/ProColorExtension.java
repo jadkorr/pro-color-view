@@ -6,6 +6,7 @@ import burp.api.montoya.logging.Logging;
 import com.procolorview.editor.ProColorRequestEditorProvider;
 import com.procolorview.editor.ProColorResponseEditorProvider;
 import com.procolorview.ai.AiConfig;
+import com.procolorview.ai.AiSettingsTab;
 import com.procolorview.util.ColorConfig;
 import com.procolorview.util.TemplateVars;
 
@@ -40,6 +41,9 @@ public class ProColorExtension implements BurpExtension {
         TemplateVars.init(api);
         ColorConfig.init(api);
         AiConfig.init(api);
+
+        // Register suite tab for global AI settings (keys stored outside project file)
+        api.userInterface().registerSuiteTab("PCV AI", new AiSettingsTab(api));
 
         // Registrar providers para Request y Response
         api.userInterface().registerHttpRequestEditorProvider(

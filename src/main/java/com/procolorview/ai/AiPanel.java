@@ -800,7 +800,7 @@ public class AiPanel extends JPanel {
         }
 
         g.gridx = 0; g.gridy = row; g.gridwidth = 3;
-        JLabel note = new JLabel("API keys are stored in the Burp project file.");
+        JLabel note = new JLabel("API keys are stored globally (user preferences) — not in the project file.");
         note.setFont(theme.editorFont.deriveFont(Font.ITALIC, 10f));
         note.setForeground(theme.bodyHint);
         panel.add(note, g);
